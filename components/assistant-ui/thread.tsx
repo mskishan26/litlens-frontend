@@ -7,6 +7,9 @@ import {
   CopyIcon,
   PencilIcon,
   RefreshCwIcon,
+  SearchIcon,
+  ShieldCheckIcon,
+  ShieldAlertIcon,
   Square,
 } from "lucide-react";
 
@@ -17,9 +20,12 @@ import {
   ErrorPrimitive,
   MessagePrimitive,
   ThreadPrimitive,
+  useThread,
+  useMessage,
 } from "@assistant-ui/react";
 
 import type { FC } from "react";
+import React from "react";
 import { LazyMotion, MotionConfig, domAnimation } from "motion/react";
 import * as m from "motion/react-m";
 
@@ -28,6 +34,7 @@ import { MarkdownText } from "@/components/assistant-ui/markdown-text";
 import { Reasoning, ReasoningGroup } from "@/components/assistant-ui/reasoning";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
+import { SourcesDisplay } from "@/components/assistant-ui/sources-display";
 import {
   ComposerAddAttachment,
   ComposerAttachments,
@@ -35,6 +42,14 @@ import {
 } from "@/components/assistant-ui/attachment";
 
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/components/auth/AuthProvider";
+import { useChatStore } from "@/lib/chat-store";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 export const Thread: FC = () => {
   return (
@@ -172,10 +187,35 @@ const ThreadSuggestions: FC = () => {
 };
 
 const Composer: FC = () => {
+  const { canQuery, setShowLoginModal, incrementQueryCount } = useAuth();
+  const thread = useThread();
+
+  // Track message count to detect when a new message is sent
+  const messageCountRef = React.useRef(thread.messages.length);
+
+  React.useEffect(() => {
+    // If message count increased, a new message was sent
+    if (thread.messages.length > messageCountRef.current) {
+      incrementQueryCount();
+    }
+    messageCountRef.current = thread.messages.length;
+  }, [thread.messages.length, incrementQueryCount]);
+
+  const handleComposerSubmit = (e: React.FormEvent) => {
+    if (!canQuery()) {
+      e.preventDefault();
+      setShowLoginModal(true);
+      return;
+    }
+  };
+
   return (
     <div className="aui-composer-wrapper sticky bottom-0 mx-auto flex w-full max-w-[var(--thread-max-width)] flex-col gap-4 overflow-visible rounded-t-3xl bg-background pb-4 md:pb-6">
       <ThreadScrollToBottom />
-      <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
+      <ComposerPrimitive.Root
+        className="aui-composer-root relative flex w-full flex-col"
+        onSubmit={handleComposerSubmit}
+      >
         <ComposerPrimitive.AttachmentDropzone className="aui-composer-attachment-dropzone group/input-group flex w-full flex-col rounded-3xl border border-input bg-background px-1 pt-2 shadow-xs transition-[color,box-shadow] outline-none has-[textarea:focus-visible]:border-ring has-[textarea:focus-visible]:ring-[3px] has-[textarea:focus-visible]:ring-ring/50 data-[dragging=true]:border-dashed data-[dragging=true]:border-ring data-[dragging=true]:bg-accent/50 dark:bg-background">
           <ComposerAttachments />
           <ComposerPrimitive.Input
@@ -195,7 +235,10 @@ const Composer: FC = () => {
 const ComposerAction: FC = () => {
   return (
     <div className="aui-composer-action-wrapper relative mx-1 mt-2 mb-2 flex items-center justify-between">
-      <ComposerAddAttachment />
+      <div className="flex items-center gap-2">
+        <ComposerAddAttachment />
+        <CheckHallucinationToggle />
+      </div>
 
       <ThreadPrimitive.If running={false}>
         <ComposerPrimitive.Send asChild>
@@ -256,6 +299,7 @@ const AssistantMessage: FC = () => {
               tools: { Fallback: ToolFallback },
             }}
           />
+          <SourcesDisplay />
           <MessageError />
         </div>
 
@@ -269,29 +313,123 @@ const AssistantMessage: FC = () => {
 };
 
 const AssistantActionBar: FC = () => {
+  const [showTrace, setShowTrace] = React.useState(false);
+  const [traceData, setTraceData] = React.useState<any>(null);
+  const [traceLoading, setTraceLoading] = React.useState(false);
+  const message = useMessage();
+  const { user } = useAuth();
+
+  const handleViewTrace = async () => {
+    const { chatId, messageIds } = useChatStore.getState();
+    console.log('[Trace] Attempting trace - chatId:', chatId, 'message.id:', message.id, 'stored messageIds:', messageIds);
+
+    if (!chatId || !message.id) {
+      console.log('[Trace] Missing IDs, cannot fetch trace');
+      setShowTrace(true);
+      setTraceData({ error: `Missing IDs - chatId: ${chatId}, messageId: ${message.id}` });
+      return;
+    }
+
+    setTraceLoading(true);
+    setShowTrace(true);
+
+    try {
+      const token = await user?.getIdToken();
+      const res = await fetch(
+        `/api/trace?chat_id=${chatId}&message_id=${message.id}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setTraceData(data);
+      } else {
+        setTraceData({ error: `Failed to fetch trace: ${res.status}` });
+      }
+    } catch (err: any) {
+      setTraceData({ error: err.message });
+    } finally {
+      setTraceLoading(false);
+    }
+  };
+
   return (
-    <ActionBarPrimitive.Root
-      hideWhenRunning
-      autohide="not-last"
-      autohideFloat="single-branch"
-      className="aui-assistant-action-bar-root col-start-3 row-start-2 -ml-1 flex gap-1 text-muted-foreground data-floating:absolute data-floating:rounded-md data-floating:border data-floating:bg-background data-floating:p-1 data-floating:shadow-sm"
-    >
-      <ActionBarPrimitive.Copy asChild>
-        <TooltipIconButton tooltip="Copy">
-          <MessagePrimitive.If copied>
-            <CheckIcon />
-          </MessagePrimitive.If>
-          <MessagePrimitive.If copied={false}>
-            <CopyIcon />
-          </MessagePrimitive.If>
+    <>
+      <ActionBarPrimitive.Root
+        hideWhenRunning
+        autohide="not-last"
+        autohideFloat="single-branch"
+        className="aui-assistant-action-bar-root col-start-3 row-start-2 -ml-1 flex gap-1 text-muted-foreground data-floating:absolute data-floating:rounded-md data-floating:border data-floating:bg-background data-floating:p-1 data-floating:shadow-sm"
+      >
+        <ActionBarPrimitive.Copy asChild>
+          <TooltipIconButton tooltip="Copy">
+            <MessagePrimitive.If copied>
+              <CheckIcon />
+            </MessagePrimitive.If>
+            <MessagePrimitive.If copied={false}>
+              <CopyIcon />
+            </MessagePrimitive.If>
+          </TooltipIconButton>
+        </ActionBarPrimitive.Copy>
+        <ActionBarPrimitive.Reload asChild>
+          <TooltipIconButton tooltip="Refresh">
+            <RefreshCwIcon />
+          </TooltipIconButton>
+        </ActionBarPrimitive.Reload>
+        <TooltipIconButton tooltip="View Trace" onClick={handleViewTrace}>
+          <SearchIcon />
         </TooltipIconButton>
-      </ActionBarPrimitive.Copy>
-      <ActionBarPrimitive.Reload asChild>
-        <TooltipIconButton tooltip="Refresh">
-          <RefreshCwIcon />
-        </TooltipIconButton>
-      </ActionBarPrimitive.Reload>
-    </ActionBarPrimitive.Root>
+      </ActionBarPrimitive.Root>
+
+      <Dialog open={showTrace} onOpenChange={setShowTrace}>
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-auto">
+          <DialogHeader>
+            <DialogTitle>Message Trace</DialogTitle>
+          </DialogHeader>
+          {traceLoading ? (
+            <div className="py-8 text-center text-muted-foreground">
+              Loading trace data...
+            </div>
+          ) : traceData?.error ? (
+            <div className="py-8 text-center text-destructive">
+              {traceData.error}
+            </div>
+          ) : traceData ? (
+            <div className="space-y-4 text-sm">
+              <div>
+                <div className="font-semibold">Query</div>
+                <div className="text-muted-foreground">
+                  {traceData.query || "N/A"}
+                </div>
+              </div>
+              <div>
+                <div className="font-semibold">Duration</div>
+                <div className="text-muted-foreground">
+                  {traceData.total_duration_ms
+                    ? `${traceData.total_duration_ms}ms`
+                    : "N/A"}
+                </div>
+              </div>
+              <div>
+                <div className="font-semibold">Sources</div>
+                <pre className="mt-1 rounded bg-muted p-2 text-xs overflow-auto">
+                  {JSON.stringify(traceData.sources || [], null, 2)}
+                </pre>
+              </div>
+              <div>
+                <div className="font-semibold">Full Trace</div>
+                <pre className="mt-1 rounded bg-muted p-2 text-xs overflow-auto max-h-64">
+                  {JSON.stringify(traceData, null, 2)}
+                </pre>
+              </div>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </>
   );
 };
 
@@ -389,4 +527,75 @@ const BranchPicker: FC<BranchPickerPrimitive.Root.Props> = ({
       </BranchPickerPrimitive.Next>
     </BranchPickerPrimitive.Root>
   );
+};
+
+const CheckHallucinationToggle: FC = () => {
+  const { enableHallucinationCheck, setEnableHallucinationCheck } =
+    useHallucinationCheck();
+
+  /**
+   * IMPORTANT: The toggle button uses a ghost variant and changes color/opacity
+   * based on the state.
+   * - Off: strict ghost styling (text-muted-foreground)
+   * - On: primary color with background tint
+   */
+  return (
+    <TooltipIconButton
+      tooltip={
+        enableHallucinationCheck
+          ? "Disable Hallucination Check"
+          : "Enable Hallucination Check"
+      }
+      variant="ghost"
+      type="button"
+      className={cn(
+        "size-[34px] rounded-full p-1 transition-colors",
+        enableHallucinationCheck
+          ? "bg-primary/20 text-primary hover:bg-primary/30"
+          : "text-muted-foreground hover:bg-muted"
+      )}
+      onClick={() => setEnableHallucinationCheck(!enableHallucinationCheck)}
+      aria-label="Toggle Hallucination Check"
+    >
+      <ShieldCheckIcon className="size-5" />
+    </TooltipIconButton>
+  );
+};
+
+// --- Context Definition ---
+
+import { createContext, useContext, useState, ReactNode } from "react";
+
+interface HallucinationCheckContextType {
+  enableHallucinationCheck: boolean;
+  setEnableHallucinationCheck: (enabled: boolean) => void;
+}
+
+const HallucinationCheckContext = createContext<
+  HallucinationCheckContextType | undefined
+>(undefined);
+
+export const HallucinationCheckProvider: React.FC<{ children: ReactNode }> = ({
+  children,
+}) => {
+  const [enableHallucinationCheck, setEnableHallucinationCheck] =
+    useState(false);
+
+  return (
+    <HallucinationCheckContext.Provider
+      value={{ enableHallucinationCheck, setEnableHallucinationCheck }}
+    >
+      {children}
+    </HallucinationCheckContext.Provider>
+  );
+};
+
+export const useHallucinationCheck = () => {
+  const context = useContext(HallucinationCheckContext);
+  if (!context) {
+    throw new Error(
+      "useHallucinationCheck must be used within a HallucinationCheckProvider"
+    );
+  }
+  return context;
 };
