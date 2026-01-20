@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { verifyIdToken } from '@/lib/firebase-admin';
 
-const BACKEND_BASE_URL = "https://mskishan26--litlens-backend-ragservice-web-app.modal.run";
+const BACKEND_BASE_URL = process.env.RAG_BACKEND_URL || "https://mskishan26--litlens-backend-lite-ragservicelite-web-app.modal.run";
 const SERVICE_TOKEN = process.env.RAG_BACKEND_SERVICE_TOKEN || "dev-secret-123";
 
 export async function GET(req: NextRequest) {

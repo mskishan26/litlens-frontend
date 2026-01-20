@@ -1,12 +1,7 @@
 import { NextRequest } from 'next/server';
 import { verifyIdToken } from '@/lib/firebase-admin';
 
-// Toggle between mock and real backend
-// const USE_MOCK = process.env.USE_MOCK_BACKEND === 'true' || process.env.NODE_ENV === 'development';
-const USE_MOCK = false;
-const BACKEND_URL = USE_MOCK
-  ? "http://localhost:3000/api/mock-backend"
-  : "https://mskishan26--litlens-backend-ragservice-web-app.modal.run/query";
+const BACKEND_URL = process.env.RAG_BACKEND_URL || "https://mskishan26--litlens-backend-lite-ragservicelite-web-app.modal.run";
 
 const SERVICE_TOKEN = process.env.RAG_BACKEND_SERVICE_TOKEN || "dev-secret-123";
 
@@ -103,7 +98,9 @@ export async function POST(req: NextRequest) {
     console.log(`[MOCK] Received question: "${question?.slice(0, 50)}..." | HalCheck: ${enableHallucinationCheck} | UserId: ${userId}`);
 
     // --- 4. CONNECT TO BACKEND ---
-    const response = await fetch(BACKEND_URL, {
+    // Ensure we append /query to the base URL
+    const baseUrl = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) : BACKEND_URL;
+    const response = await fetch(`${baseUrl}/query`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -275,14 +272,8 @@ export async function POST(req: NextRequest) {
               sendEvent({ type: "text-delta", id: textId, delta: sourceText });
             }
 
-            // Send hallucination as custom data part (for potential UI components)
-            if (hallucinationResult) {
-              sendEvent({ type: "data-hallucination", data: hallucinationResult });
-            }
-
             sendEvent({ type: "text-end", id: textId });
             sendEvent({ type: "finish-step" });
-            sendEvent({ type: "data-metadata", chatId: conversationId, messageId: messageId });
             sendEvent({ type: "finish" });
 
           } else {

@@ -65,19 +65,38 @@ export function createRemoteThreadListAdapter(getUser: () => User | null) {
             try {
                 const headers = await getAuthHeaders();
                 if (!headers) {
+                    console.log('[ThreadAdapter] User not authenticated, returning empty threads');
                     return { threads: [] };
                 }
+                
+                console.log('[ThreadAdapter] Fetching chats from /api/chats');
                 const res = await fetch('/api/chats?limit=50', { headers });
 
                 if (!res.ok) {
-                    console.error('[ThreadAdapter] List failed:', res.status, await res.text());
+                    const errorText = await res.text();
+                    console.error('[ThreadAdapter] List failed:', res.status, errorText);
+                    
+                    // If backend returns 501 or persistence errors, return empty threads
+                    if (res.status === 501 || errorText.includes('Persistence not configured')) {
+                        console.log('[ThreadAdapter] Backend persistence not available, returning empty threads');
+                        return { threads: [] };
+                    }
+                    
                     return { threads: [] };
                 }
 
                 const data = await res.json();
                 console.log('[ThreadAdapter] Raw chats response:', data);
 
-                const chats: BackendChat[] = data.chats || [];
+                // Handle different response formats
+                let chats: BackendChat[] = [];
+                if (data.chats && Array.isArray(data.chats)) {
+                    chats = data.chats;
+                } else if (Array.isArray(data)) {
+                    chats = data;
+                } else if (data.data && Array.isArray(data.data)) {
+                    chats = data.data;
+                }
 
                 // Transform backend format to RemoteThreadMetadata
                 const threads: RemoteThreadMetadata[] = chats.map((chat) => {
@@ -151,12 +170,12 @@ export function createRemoteThreadListAdapter(getUser: () => User | null) {
          * Initialize a new thread - called when creating a new conversation
          */
         async initialize(threadId: string): Promise<RemoteThreadInitializeResponse> {
-            // For now, we let the backend create the chat on first message
-            // The remoteId will be set when we receive it from the response
-            console.log('[ThreadAdapter] Initialize:', threadId);
+            // Don't generate a chat ID for new threads - let the backend create it on first message
+            // Return empty/placeholder values to prevent unwanted chat ID generation
+            console.log('[ThreadAdapter] Initialize called for threadId:', threadId, '- deferring to backend');
             return {
-                remoteId: threadId,
-                externalId: threadId,
+                remoteId: '',  // Empty to indicate no remote ID yet
+                externalId: '', // Empty to indicate no external ID yet
             };
         },
 

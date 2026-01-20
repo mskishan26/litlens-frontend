@@ -5,7 +5,10 @@ import { cn } from "@/lib/utils";
 
 export const SourcesDisplay: FC = () => {
     const message = useMessage();
-    const { sources, hallucination } = (message.metadata as any) || {};
+    // Check both metadata.custom (for loaded history) and metadata root (for streaming)
+    const metadata = message.metadata as any;
+    const sources = metadata?.custom?.sources || metadata?.sources;
+    const hallucination = metadata?.custom?.hallucination ?? metadata?.hallucination;
 
     if (!sources && hallucination === undefined) return null;
 

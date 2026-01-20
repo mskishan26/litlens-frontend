@@ -32,6 +32,7 @@ import { AuthProvider, useAuth } from "@/components/auth/AuthProvider";
 import { LoginModal } from "@/components/auth/LoginModal";
 import { UserMenu } from "@/components/auth/UserMenu";
 import { useChatStore } from "@/lib/chat-store";
+import { useRouter } from "next/navigation";
 
 const ThreadTitle = () => {
   const title = useAssistantState((state: any) => {
@@ -56,7 +57,7 @@ const ThreadTitle = () => {
   return <span className='font-semibold'>{title || "New Chat"}</span>;
 };
 
-const AssistantRuntimeLayer = () => {
+const AssistantRuntimeLayer = ({ chatId }: { chatId?: string }) => {
   const { user, isAnonymous, loading } = useAuth();
 
   const { enableHallucinationCheck } = useHallucinationCheck();
@@ -64,7 +65,7 @@ const AssistantRuntimeLayer = () => {
 
   // Chat store for tracking IDs and queries
   const {
-    chatId,
+    chatId: storeChatId,
     userQueries,
     titleGenerated,
     setChatId,
@@ -80,9 +81,8 @@ const AssistantRuntimeLayer = () => {
 
   // Auto-generate title after 2+ queries for non-anonymous users
   useEffect(() => {
-    console.log('[Title] Effect check - queries:', userQueries.length, 'chatId:', chatId, 'isAnon:', isAnonymous, 'titleGen:', titleGenerated, 'hasUser:', !!user);
-
-    if (userQueries.length >= 2 && !isAnonymous && chatId && !titleGenerated && user) {
+    console.log('[Title] Effect check - queries:', userQueries.length, 'chatId:', storeChatId, 'isAnon:', isAnonymous, 'titleGen:', titleGenerated, 'hasUser:', !!user);
+    if (userQueries.length >= 2 && !isAnonymous && storeChatId && !titleGenerated && user) {
       console.log('[Title] Conditions met, generating title...');
       const generateTitle = async () => {
         try {
@@ -94,7 +94,7 @@ const AssistantRuntimeLayer = () => {
               'Authorization': `Bearer ${token}`,
             },
             body: JSON.stringify({
-              chat_id: chatId,
+              chat_id: storeChatId,
               queries: userQueries.slice(0, 3)
             }),
           });
@@ -106,7 +106,7 @@ const AssistantRuntimeLayer = () => {
               useChatStore.getState().setPendingTitle(data.title);
               console.log('[Title] Generated title:', data.title);
             }
-            console.log('[Title] Auto-generated title for chat:', chatId);
+            console.log('[Title] Auto-generated title for chat:', storeChatId);
           } else {
             console.error('[Title] Generate failed:', await res.text());
           }
@@ -116,7 +116,7 @@ const AssistantRuntimeLayer = () => {
       };
       generateTitle();
     }
-  }, [userQueries.length, chatId, isAnonymous, titleGenerated, user, userQueries, setTitleGenerated]);
+  }, [userQueries.length, storeChatId, isAnonymous, titleGenerated, user, userQueries, setTitleGenerated]);
 
   // Create thread list adapter (memoized to prevent recreation)
   const threadListAdapter = useMemo(() => {
@@ -135,11 +135,14 @@ const AssistantRuntimeLayer = () => {
             String(enableHallucinationCheckRef.current)
           );
 
-          // Pass existing conversation ID to maintain continuity
+          // Only pass existing conversation ID if we have a valid one from the store
+          // Don't pass auto-generated conversation IDs
           const currentChatId = useChatStore.getState().chatId;
-          if (currentChatId) {
+          if (currentChatId && currentChatId.startsWith('conv_')) {
             url.searchParams.set("conv_id", currentChatId);
             console.log('[Chat] Using existing chatId:', currentChatId);
+          } else {
+            console.log('[Chat] No valid chatId found, letting backend create new one');
           }
 
           const headers = new Headers(init?.headers);
@@ -220,7 +223,7 @@ const AssistantRuntimeLayer = () => {
 
           console.log('[Chat] Response headers - conversationId:', conversationId, 'messageId:', messageId);
 
-          if (conversationId) {
+          if (conversationId && conversationId.startsWith('conv_')) {
             const currentChatId = useChatStore.getState().chatId;
             if (!currentChatId || currentChatId !== conversationId) {
               useChatStore.getState().setChatId(conversationId);
@@ -252,6 +255,7 @@ const AssistantRuntimeLayer = () => {
     <AssistantRuntimeProvider runtime={runtime}>
       <MessageHistoryLoader />
       <TitleUpdater />
+      <UrlSync chatId={chatId} />
       <SidebarProvider>
         <div className="flex h-dvh w-full pr-0.5">
           <ThreadListSidebar />
@@ -283,6 +287,80 @@ const AssistantRuntimeLayer = () => {
       <LoginModal />
     </AssistantRuntimeProvider>
   );
+};
+
+const UrlSync = ({ chatId }: { chatId?: string }) => {
+  const runtime = useAssistantRuntime();
+  const router = useRouter();
+  const currentChatId = useChatStore((s) => s.chatId);
+  const { user, loading: authLoading } = useAuth();
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
+
+  // Listen for thread list to be loaded
+  useEffect(() => {
+    if (!runtime || authLoading) return;
+
+    const checkThreadsLoaded = () => {
+      const threads = runtime.threads;
+      if (threads && typeof threads.getState === 'function') {
+        const state = threads.getState();
+        console.log('[UrlSync] Thread list state:', state);
+        if (state.threads && state.threads.length > 0) {
+          console.log('[UrlSync] Thread list loaded with', state.threads.length, 'threads');
+          setThreadsLoaded(true);
+        }
+      }
+    };
+
+    // Check immediately
+    checkThreadsLoaded();
+
+    // Also listen for changes
+    let unsubscribe: (() => void) | undefined;
+    try {
+      unsubscribe = runtime.threads?.subscribe?.(checkThreadsLoaded);
+    } catch (err) {
+      console.log('[UrlSync] Could not subscribe to thread list changes:', err);
+    }
+
+    return () => {
+      unsubscribe?.();
+    };
+  }, [runtime, authLoading]);
+
+  // 1. Initial Load / Navigation: If URL has chatId, switch to it (only when threads are loaded)
+  useEffect(() => {
+    if (chatId && runtime && threadsLoaded) {
+      console.log('[UrlSync] Attempting to switch to chat from URL:', chatId);
+      
+      try {
+        runtime.switchToThread(chatId);
+        useChatStore.getState().setChatId(chatId);
+        console.log('[UrlSync] Successfully switched to chat:', chatId);
+      } catch (err: any) {
+        console.error('[UrlSync] Failed to switch to chat:', chatId, err);
+        // If we can't switch to the thread, treat it as a new chat
+        window.history.pushState(null, '', '/');
+      }
+    }
+  }, [chatId, runtime, threadsLoaded]);
+
+  // 2. State Change: If internal chat ID changes (e.g. new chat created), update URL
+  useEffect(() => {
+    // Only update if we have a user (anonymous or auth) and a valid chatId
+    if (currentChatId && currentChatId !== chatId) {
+      console.log('[UrlSync] Updating URL to match chat:', currentChatId);
+      // Use replace to avoid building up huge history, or push for navigation
+      // Using push is better for browser back button behavior
+      window.history.pushState(null, '', `/c/${currentChatId}`);
+    } else if (!currentChatId && chatId) {
+      // If state is cleared (new chat), go to root
+      console.log('[UrlSync] Clearing URL (new chat)');
+      window.history.pushState(null, '', '/');
+    }
+  }, [currentChatId, chatId]);
+
+  return null;
 };
 
 // Component that applies pending title updates using the runtime
@@ -317,124 +395,283 @@ const TitleUpdater = () => {
 
 const MessageHistoryLoader = () => {
   const runtime = useAssistantRuntime();
-  const threadId = useAssistantState((s: any) => s.threadId);
-  const threads = useAssistantState((s: any) => s.threads);
-  console.log('[History] Loader Selectors - ThreadId:', threadId, 'Threads:', threads?.length);
-
-  useEffect(() => {
-    console.log('!!! LOADER MOUNTED !!!');
-    return () => console.log('!!! LOADER UNMOUNTED !!!');
-  }, []);
-
+  const thread = useThread();
   const { user } = useAuth();
-  const [isLoading, setIsLoading] = useState(false);
-  // Use a map to track verification status of threads to avoid refetching
+
+  // Track which threads we've already loaded to avoid refetching
   const loadedThreads = useRef(new Set<string>());
+  const prevThreadIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const fetchMessages = async () => {
-      console.log('[History] Effect triggered. threadId:', threadId, 'isLoading:', isLoading, 'hasUser:', !!user, 'alreadyLoaded:', loadedThreads.current.has(threadId));
-      if (!threadId || loadedThreads.current.has(threadId) || isLoading || !user) {
-        console.log('[History] Skipping fetch due to conditions');
+    const fetchAndLoadMessages = async () => {
+      // Get thread ID from runtime state
+      const currentThreadId = thread.threadId;
+
+      // Skip if no thread, no user, already loaded, or same thread
+      if (!currentThreadId || !user) {
         return;
       }
 
-      // Check if thread already has messages
-      // @ts-ignore
-      const threadMessages = runtime.threads?.getItemById(threadId)?.messages;
-      if (threadMessages && threadMessages.length > 0) {
-        loadedThreads.current.add(threadId);
+      // Skip if we already loaded this thread
+      if (loadedThreads.current.has(currentThreadId)) {
         return;
       }
 
-      console.log('[History] Fetching messages for thread:', threadId);
-      setIsLoading(true);
+      // Skip if thread already has messages (it's active/current)
+      if (thread.messages && thread.messages.length > 0) {
+        loadedThreads.current.add(currentThreadId);
+        return;
+      }
+
+      // Only fetch when thread ID actually changes to a different thread
+      if (prevThreadIdRef.current === currentThreadId) {
+        return;
+      }
+
+      prevThreadIdRef.current = currentThreadId;
+      console.log('[History] Loading messages for thread:', currentThreadId);
 
       try {
         const token = await user.getIdToken();
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'X-User-Anonymous': String(user.isAnonymous),
         };
-        headers['X-User-Anonymous'] = String(user.isAnonymous);
 
-        const res = await fetch(`/api/chats/${threadId}/messages`, { headers });
+        const res = await fetch(`/api/chats/${currentThreadId}/messages`, { headers });
 
         if (res.ok) {
           const data = await res.json();
-          console.log('[History] Raw messages data:', data);
+          console.log('[History] Raw response data:', JSON.stringify(data, null, 2));
+          console.log('[History] Received messages:', data.messages?.length || 0);
 
-          if (data.messages && Array.isArray(data.messages)) {
-            // Convert messages
-            const convertedMessages = data.messages.map((msg: any) => {
-              const role = msg.role || (msg.sender === 'user' ? 'user' : 'assistant');
-              // Handle different content formats
-              let content = msg.content || msg.text || '';
-              if (typeof content === 'object') {
-                content = JSON.stringify(content);
+          if (data.messages && Array.isArray(data.messages) && data.messages.length > 0) {
+            // Log first message structure for debugging
+            console.log('[History] First message structure:', JSON.stringify(data.messages[0], null, 2));
+
+            // Convert backend messages to assistant-ui format
+            // Backend format: each message has both 'query' (user) and 'answer' (assistant)
+            // We need to split each into two separate messages
+            const convertedMessages: any[] = [];
+
+            data.messages.forEach((msg: any) => {
+              const messageId = msg.MessageId || msg.message_id || msg.id || `msg-${Date.now()}`;
+              const timestamp = msg.timestamp ? new Date(msg.timestamp) : new Date();
+
+              console.log('[History] Processing backend message:', { messageId, hasQuery: !!msg.query, hasAnswer: !!msg.answer });
+
+              // Create user message from query
+              // ThreadMessage format requires: id, role, createdAt, content, metadata
+              if (msg.query) {
+                const userMessage = {
+                  id: `${messageId}-user`,
+                  role: 'user' as const,
+                  createdAt: timestamp,
+                  content: [{ type: 'text' as const, text: msg.query }],
+                  metadata: {
+                    unstable_annotations: [],
+                    unstable_data: [],
+                    steps: [],
+                    custom: {},
+                  },
+                };
+                console.log('[History] Created user message:', { id: userMessage.id, contentLength: msg.query.length });
+                convertedMessages.push(userMessage);
               }
 
-              return {
-                id: msg.id || msg.message_id || Math.random().toString(36).substring(7),
-                role,
-                content: [{ type: 'text', text: content }],
-                metadata: {
-                  sources: msg.sources,
-                  hallucination: msg.hallucination_check,
-                  timestamp: msg.timestamp || msg.created_at
-                }
-              };
+              // Create assistant message from answer
+              if (msg.answer) {
+                const assistantMessage = {
+                  id: `${messageId}-assistant`,
+                  role: 'assistant' as const,
+                  status: { type: 'complete' as const, reason: 'stop' as const },
+                  createdAt: timestamp,
+                  content: [{ type: 'text' as const, text: msg.answer }],
+                  metadata: {
+                    unstable_annotations: [],
+                    unstable_data: [],
+                    steps: [],
+                    custom: {
+                      sources: msg.sources || [],
+                      hallucination: msg.hallucination_check,
+                    },
+                  },
+                };
+                console.log('[History] Created assistant message:', { id: assistantMessage.id, contentLength: msg.answer.length, hasSources: !!(msg.sources && msg.sources.length > 0) });
+                convertedMessages.push(assistantMessage);
+              }
+
+              console.log('[History] Converted message pair:', messageId);
             });
 
-            // Append messages to runtime
-            const thread = runtime.threads?.getItemById(threadId);
-            if (thread) {
-              for (const m of convertedMessages) {
-                // @ts-ignore
-                if (typeof thread.append === 'function') {
-                  // @ts-ignore
-                  thread.append(m);
+            console.log('[History] Converted messages:', convertedMessages.length);
+
+            // Validate message format before importing
+            console.log('[History] Validating message format...');
+            convertedMessages.forEach((msg, index) => {
+              const validation = {
+                id: msg.id,
+                role: msg.role,
+                hasValidRole: msg.role === 'user' || msg.role === 'assistant',
+                hasContent: msg.content && Array.isArray(msg.content) && msg.content.length > 0,
+                contentStructure: msg.content?.[0] ? {
+                  hasType: !!msg.content[0].type,
+                  type: msg.content[0].type,
+                  hasText: !!msg.content[0].text,
+                  textLength: msg.content[0].text?.length || 0
+                } : null,
+                hasMetadata: !!msg.metadata,
+                metadataStructure: msg.metadata ? {
+                  hasCustom: !!msg.metadata.custom,
+                  hasUnstableAnnotations: !!msg.metadata.unstable_annotations,
+                  hasUnstableData: !!msg.metadata.unstable_data,
+                  hasSteps: !!msg.metadata.steps
+                } : null,
+                hasStatus: msg.role === 'assistant' ? !!msg.status : 'N/A',
+                statusStructure: msg.status ? {
+                  hasType: !!msg.status.type,
+                  type: msg.status.type,
+                  hasReason: !!msg.status.reason,
+                  reason: msg.status.reason
+                } : null
+              };
+              
+              console.log(`[History] Message ${index} validation:`, validation);
+              
+              // Check for missing required fields
+              if (!validation.hasValidRole || !validation.hasContent || !validation.hasMetadata) {
+                console.error(`[History] Message ${index} FAILED validation:`, validation);
+              }
+            });
+
+            // Debug: log what methods are available on runtime.thread
+            console.log('[History] runtime.thread methods:', runtime.thread ? Object.keys(runtime.thread) : 'no thread');
+
+            // Try to import messages into the thread
+            // First try import, if it fails, try reset with initial messages
+            try {
+              console.log('[History] Attempting import with', convertedMessages.length, 'messages');
+
+              // Build proper ExportedMessageRepository format
+              const importRepository = {
+                headId: convertedMessages.length > 0
+                  ? convertedMessages[convertedMessages.length - 1].id
+                  : null,
+                messages: convertedMessages.map((msg, index) => ({
+                  message: msg,
+                  parentId: index === 0 ? null : convertedMessages[index - 1].id,
+                })),
+              };
+
+              console.log('[History] Import repository format:', { 
+                headId: importRepository.headId, 
+                messageCount: importRepository.messages.length 
+              });
+
+              // Try reset with initial messages instead of import
+              if (runtime.thread && typeof runtime.thread.reset === 'function') {
+                try {
+                  console.log('[History] Before reset - thread state:', {
+                    messageCount: runtime.thread.getState().messages?.length || 0
+                  });
+                  
+                  // Reset with initial messages
+                  runtime.thread.reset(convertedMessages);
+                  console.log('[History] Thread reset with initial messages!');
+                  
+                  // Check thread state IMMEDIATELY after reset
+                  const immediateState = runtime.thread.getState();
+                  console.log('[History] IMMEDIATE thread state after reset:', {
+                    messageCount: immediateState.messages?.length || 0,
+                    messageIds: immediateState.messages?.map((m: any) => m.id),
+                    threadId: immediateState.threadId
+                  });
+                  
+                  // Check thread state after a delay
+                  setTimeout(() => {
+                    const delayedState = runtime.thread.getState();
+                    console.log('[History] DELAYED thread state after reset:', {
+                      messageCount: delayedState.messages?.length || 0,
+                      messageIds: delayedState.messages?.map((m: any) => m.id),
+                      threadId: delayedState.threadId
+                    });
+                  }, 100);
+                  
+                } catch (resetErr: any) {
+                  console.log('[History] Reset failed, trying fallback append method:', resetErr?.message);
+                  
+                  // Fallback: append messages one by one
+                  for (const msg of convertedMessages) {
+                    try {
+                      runtime.thread.append(msg);
+                      console.log('[History] Appended message via fallback:', msg.id);
+                    } catch (appendErr: any) {
+                      console.error('[History] Failed to append message via fallback:', msg.id, appendErr?.message);
+                    }
+                  }
+                  console.log('[History] Fallback append completed');
+                }
+              } else {
+                console.log('[History] reset method not available, using append method');
+                
+                // Fallback: use append method directly
+                for (const msg of convertedMessages) {
+                  try {
+                    runtime.thread.append(msg);
+                    console.log('[History] Appended message via fallback:', msg.id);
+                  } catch (appendErr: any) {
+                    console.error('[History] Failed to append message via fallback:', msg.id, appendErr?.message);
+                  }
                 }
               }
+            } catch (importErr: any) {
+              console.log('[History] Import failed:', importErr?.message);
+              console.log('[History] Error details:', importErr);
             }
 
-            loadedThreads.current.add(threadId);
+            // Also update the chat store with the thread ID
+            useChatStore.getState().setChatId(currentThreadId);
+
+            loadedThreads.current.add(currentThreadId);
           }
         } else {
-          console.error('[History] Failed to fetch:', await res.text());
+          const errorText = await res.text();
+          console.error('[History] Failed to fetch:', res.status, errorText);
+          
+          // If backend returns 501 or persistence errors, don't treat as critical error
+          if (res.status === 501 || errorText.includes('Persistence not configured')) {
+            console.log('[History] Backend persistence not available, treating as new chat');
+            loadedThreads.current.add(currentThreadId); // Mark as loaded to prevent retry
+          }
         }
       } catch (err) {
         console.error('[History] Error fetching messages:', err);
-      } finally {
-        setIsLoading(false);
       }
     };
 
-    fetchMessages();
-  }, [threadId, runtime, user]);
+    fetchAndLoadMessages();
+  }, [thread.threadId, thread.messages.length, runtime, user]);
 
-  return <div style={{ position: 'fixed', bottom: 10, right: 10, background: 'red', color: 'white', padding: '10px', zIndex: 9999, pointerEvents: 'none' }}>
-    Active Thread: {threadId || 'None'} <br />
-    Threads: {Array.isArray(threads) ? threads.length : 'Not Array'} <br />
-    Loading: {String(isLoading)}
-  </div>;
+  // This component doesn't render anything visible
+  return null;
 }
 
-const AssistantImpl = () => {
+const AssistantImpl = ({ chatId }: { chatId?: string }) => {
   const { user, loading } = useAuth();
 
   if (loading) {
     return <div className="flex h-dvh w-full items-center justify-center bg-background text-muted-foreground">Loading...</div>;
   }
 
-  return <AssistantRuntimeLayer key={user?.uid || 'anonymous'} />;
+  return <AssistantRuntimeLayer key={user?.uid || 'anonymous'} chatId={chatId} />;
 };
 
-export const Assistant = () => {
+export const Assistant = ({ chatId }: { chatId?: string }) => {
   return (
     <AuthProvider>
       <HallucinationCheckProvider>
-        <AssistantImpl />
+        <AssistantImpl chatId={chatId} />
       </HallucinationCheckProvider>
     </AuthProvider>
   );
